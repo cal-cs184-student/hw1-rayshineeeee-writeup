@@ -1,112 +1,167 @@
-<html>
-	<head>
-		<script src='https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.4/MathJax.js?config=default'></script>
-		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-		<style>
-			h1 {
-				text-align: center;
-			}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Ray Sun's CS 184 Homework 1 rasterizer: triangle coverage, supersampling, transforms, barycentric colors, texture filtering, and extra credit.">
+  <title>Homework 1: Rasterizer | Ray Sun</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Homework 1: Rasterizer</h1>
+    <p class="byline">Ray Sun · CS 184 · Fall 2026</p>
+    <p class="links">Webpage: <a href="https://cal-cs184-student.github.io/hw1-rayshineeeee-writeup/">cal-cs184-student.github.io/hw1-rayshineeeee-writeup/</a></p>
+    <p class="links"><a href="https://github.com/cal-cs184-student/hw1-rayshineeeee-writeup">Write-up repository</a> · <a href="https://github.com/cal-cs184-student/hw1-rayshineeeee">Code repository</a><span class="download"> · <a href="hw1-writeup.pdf">Download PDF</a></span></p>
+    <nav aria-label="Report sections">
+      <a href="#overview">Overview</a><a href="#task1">Task 1</a><a href="#task2">Task 2</a>
+      <a href="#task3">Task 3</a><a href="#task4">Task 4</a><a href="#task5">Task 5</a>
+      <a href="#task6">Task 6</a><a href="#art">Art competition</a>
+    </nav>
+  </header>
 
-			.container {
-				margin: 0 auto;
-				padding: 60px 20%;
-			}
+  <section id="overview" aria-labelledby="overview-title">
+    <h2 id="overview-title">Overview</h2>
+    <p>I built a software rasterizer that turns SVG geometry into pixels. It tests triangle coverage, averages subpixel samples to smooth edges, applies transforms, and interpolates colors and texture coordinates. Texture filtering then decides which texels and mip levels contribute to each sample.</p>
+    <p>The main connection I learned is that both jagged edges and texture moiré come from sampling too little information. Supersampling estimates coverage within a screen pixel, while mipmaps prefilter texture detail before lookup. Storing each pixel's samples together also made the link between a 2D image and its 1D buffer clearer.</p>
+    <p>A few implementation details mattered: resizing the sample buffer when the window or sample rate changes, filling every sample for points and lines, and using double precision for shared-edge calculations. I also fixed the mip-generation loop so it fills the last level, which is needed when a texture becomes very small on screen.</p>
+    <p>The extra credit adds scanline filling, jittered samples, viewport rotation, and anisotropic filtering. The final artwork is a simplified Campanile based on a photo I took.</p>
+  </section>
 
-			figure {
-				text-align: center;
-			}
+  <section id="task1" aria-labelledby="task1-title">
+    <h2 id="task1-title">Task 1: Drawing single-color triangles</h2>
+    <p>I skip zero-area triangles, find the smallest rectangle containing the three vertices, and clip that bounding box to the framebuffer. At one sample per pixel, I test the center, (x + 0.5, y + 0.5), against the three edges. The point is inside when all edge values have the same sign. Accepting either sign handles both vertex orders; allowing zero includes points on an edge.</p>
+    <p>A covered sample receives the triangle's color in the sample buffer. The bounding-box version visits only pixels in that box and does three constant-time edge tests per sample. Its work is proportional to the number of samples in the box, meeting the required bound. Clipping skips off-screen samples.</p>
+<figure class="single"><a class="image-link" href="assets/task1-test4.png" aria-label="Open full-size Single-color triangles with the pixel inspector"><img src="assets/task1-test4.png" width="1600" height="1200" alt="basic/test4.svg at the default view, with the inspector showing the thin red triangle at one sample per pixel"></a><figcaption>Single-color triangles with the pixel inspector</figcaption></figure>
+    <div class="extra" id="task1-extra">
+      <h3>Extra credit: scanline filling</h3>
+      <p>I precompute the edge equations and find the covered interval on each sample row. After testing the endpoints, I fill the span without repeating three edge tests for every interior sample. <kbd>O</kbd> switches between scanline filling and the bounding-box baseline. Scanlines are the default for a regular sample grid; jitter uses bounding-box tests.</p>
+      <div class="table-wrap"><table>
+        <caption class="sr-caption">Triangle rasterization timings</caption>
+        <thead><tr><th scope="col">Scene</th><th scope="col" class="num">Bounding box</th><th scope="col" class="num">Scanline</th><th scope="col" class="num">Speedup</th></tr></thead>
+        <tbody><tr><td>basic/test4.svg</td><td class="num">0.396 ms</td><td class="num">0.064 ms</td><td class="num">6.19×</td></tr>
+        <tr><td>illustration/05_lion.svg</td><td class="num">2.295 ms</td><td class="num">0.389 ms</td><td class="num">5.90×</td></tr>
+        <tr><td>illustration/09_kochcurve.svg</td><td class="num">0.114 ms</td><td class="num">0.107 ms</td><td class="num">1.07×</td></tr></tbody>
+      </table></div>
+      <p class="credit">Measured with <code>clock()</code> around <code>SVG::draw</code> in a Release build at 1024×1024 and 1 sample per pixel. Each value is the median of seven draws after one warm-up, excluding loading, clearing, resolving, and PNG output. Large triangles benefit most; tiny triangles leave little work to skip. The methods produced identical pixels for 4,000 random triangles across sample rates 1, 4, 9, and 16.</p>
+    </div>
+  </section>
 
-			img {
-				display: inline-block;
-			}
+  <section id="task2" aria-labelledby="task2-title">
+    <h2 id="task2-title">Task 2: Antialiasing by supersampling</h2>
+    <p>One sample can miss thin geometry and gives jagged edges because a pixel is either covered or uncovered. I divide each pixel into a √sample_rate × √sample_rate grid and test every cell center. Four samples use a 2×2 grid at offsets 0.25 and 0.75; sixteen use a 4×4 grid. The average color estimates how much of the pixel the triangle covers.</p>
+    <p>The <code>sample_buffer</code> holds <code>width * height * sample_rate</code> colors, with each pixel's samples stored consecutively. Pixel (x, y) starts at:</p>
+    <div class="equation">first_sample = (y × width + x) × sample_rate</div>
+    <p>The term <code>y * width</code> skips preceding rows, <code>x</code> selects the column, and multiplying by the sample rate skips preceding groups of samples. I resize the buffer when the sample rate or framebuffer changes and clear it to white before each redraw. Points and lines fill all samples of their pixel; triangles update only covered samples.</p>
+    <p>After all shapes are drawn, <code>resolve_to_framebuffer</code> averages each pixel's sample colors and converts the result to 8-bit RGB. Keeping samples separate until then preserves uncovered background and handles overlapping shapes.</p>
+<div class="image-grid three"><figure class=""><a class="image-link" href="assets/task2-test4-1.png" aria-label="Open full-size 1 sample"><img src="assets/task2-test4-1.png" width="1600" height="1200" alt="basic/test4.svg at the default view with 1 samples per pixel and an inspector on the red edge"></a><figcaption>1 sample</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task2-test4-4.png" aria-label="Open full-size 4 samples"><img src="assets/task2-test4-4.png" width="1600" height="1200" alt="basic/test4.svg at the default view with 4 samples per pixel and an inspector on the red edge"></a><figcaption>4 samples</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task2-test4-16.png" aria-label="Open full-size 16 samples"><img src="assets/task2-test4-16.png" width="1600" height="1200" alt="basic/test4.svg at the default view with 16 samples per pixel and an inspector on the red edge"></a><figcaption>16 samples</figcaption></figure></div><div class="image-grid three"><figure class=""><a class="image-link" href="assets/task2-test4-1.png" aria-label="Open full-size 1 sample, detail"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task2-test4-1.png" width="1600" height="1200" alt="Enlarged pixel inspector of the red triangle at 1 samples per pixel"></span></a><figcaption>1 sample, detail</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task2-test4-4.png" aria-label="Open full-size 4 samples, detail"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task2-test4-4.png" width="1600" height="1200" alt="Enlarged pixel inspector of the red triangle at 4 samples per pixel"></span></a><figcaption>4 samples, detail</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task2-test4-16.png" aria-label="Open full-size 16 samples, detail"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task2-test4-16.png" width="1600" height="1200" alt="Enlarged pixel inspector of the red triangle at 16 samples per pixel"></span></a><figcaption>16 samples, detail</figcaption></figure></div>
+    <p>At 1 sample, the inspector shows abrupt white-to-red steps. At 4 samples, coverage changes in quarters, adding light red boundary pixels. At 16, coverage changes in sixteenths and the edge becomes smoother. The output resolution stays the same; only the coverage estimate improves. Thin features can still fall between samples, and higher rates use more memory and rasterization work.</p>
+    <div class="extra print-page" id="task2-extra">
+      <h3>Task 2 extra credit: jittered sampling</h3>
+      <p><kbd>J</kbd> replaces each grid-cell center with one jittered position inside that cell. A hash of the pixel and sample index keeps positions stable across redraws and consistent across shared edges. At 1 sample per pixel, I retain center sampling.</p>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task2-ec-grid.png" aria-label="Open full-size Grid, 4 samples"><span class="crop" style="--ratio:1040/1040; --width:153.846154%; --left:-26.923077%; --top:-7.692308%;"><img src="assets/task2-ec-grid.png" width="1600" height="1200" alt="Grid sampling of a gray reference rectangle beside thin black stripes"></span></a><figcaption>Grid, 4 samples</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task2-ec-jitter.png" aria-label="Open full-size Jittered, 4 samples"><span class="crop" style="--ratio:1040/1040; --width:153.846154%; --left:-26.923077%; --top:-7.692308%;"><img src="assets/task2-ec-jitter.png" width="1600" height="1200" alt="Jittered sampling of a gray reference rectangle beside thin black stripes"></span></a><figcaption>Jittered, 4 samples</figcaption></figure></div>
+      <p>In the thin-stripe scene, the left rectangle is a gray reference and the right contains narrow black stripes. At this scale, all four regular samples miss the stripes, leaving white. Jitter breaks that alignment and recovers the average coverage, with visible noise. A matching coverage check averaged 83.8% white, close to the expected 84%. Both captures use a 1600×1200 framebuffer.</p>
+    </div>
+  </section>
 
-			body {
-				font-family: 'Inter', sans-serif;
-			}
-		</style>
-	</head>
-	<body>
-		<div class="container">
-		<h1>CS184/284A Fall 2026 Homework 1 Write-Up</h1>
-		<div style="text-align: center;">Names: </div>
+  <section id="task3" aria-labelledby="task3-title">
+    <h2 id="task3-title">Task 3: Transforms</h2>
+    <p>I implemented translation, scaling, and rotation with 3×3 matrices applied to homogeneous points (x, y, 1). Translation uses the last column, scaling multiplies each axis, and rotation uses sine and cosine after converting degrees to radians.</p>
+    <p>For <a href="my_robot.svg">my_robot.svg</a>, I made cubeman wave hello. The arm on the right has a −35° shoulder rotation and a nested −70° elbow rotation. Translating the groups to the joints makes each rotation pivot at the correct place; nesting keeps the forearm attached when the shoulder moves. I angled the other arm downward, tilted the head to 30°, and used blue and gold.</p>
+<figure class="single"><a class="image-link" href="assets/task3-my-robot.png" aria-label="Open full-size Waving cubeman"><img src="assets/task3-my-robot.png" width="1600" height="1200" alt="Blue-and-gold cubeman with a raised bent arm and tilted head"></a><figcaption>Waving cubeman</figcaption></figure>
+    <div class="extra print-page" id="task3-extra">
+      <h3>Task 3 extra credit: viewport rotation</h3>
+      <p><kbd>Q</kbd> and <kbd>E</kbd> rotate the view counterclockwise and clockwise in 15° steps. I rotate around the center of normalized device coordinates (NDC), between the SVG-to-NDC and NDC-to-screen matrices:</p>
+      <div class="equation">M<sub>screen</sub> · T(0.5, 0.5) · R(θ) · T(−0.5, −0.5) · M<sub>SVG→NDC</sub></div>
+      <p>Reading right to left, the existing view matrix applies pan and zoom. The middle matrices move the NDC center to the origin, rotate, and move it back. The final matrix maps to screen pixels. The entire view rotates, including the SVG border.</p>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task3-ec-original.png" aria-label="Open full-size Original"><img src="assets/task3-ec-original.png" width="1600" height="1200" alt="Unrotated cubeman viewport at 4 samples per pixel"></a><figcaption>Original</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task3-ec-rotated.png" aria-label="Open full-size 30° clockwise"><img src="assets/task3-ec-rotated.png" width="1600" height="1200" alt="Cubeman and its canvas rotated 30 degrees clockwise at 4 samples per pixel"></a><figcaption>30° clockwise</figcaption></figure></div>
+      <p>Dragging uses the inverse rotation so movement follows the mouse. Zooming and resizing preserve the angle; Space resets rotation along with pan and zoom. Both views use 4 samples per pixel.</p>
+    </div>
+  </section>
 
-		<br>
+  <section id="task4" aria-labelledby="task4-title">
+    <h2 id="task4-title">Task 4: Barycentric coordinates</h2>
+    <p>Barycentric coordinates express a point as three vertex weights:</p>
+    <div class="equation">P = αA + βB + γC, &nbsp; α + β + γ = 1</div>
+    <p>Inside the triangle the weights are nonnegative. At A they are (1, 0, 0); halfway between A and B they are (½, ½, 0); at the centroid each is ⅓. I use those same weights to blend the vertex colors.</p>
+    <div class="equation">color(P) = α color(A) + β color(B) + γ color(C)</div>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task4-triangle.png" aria-label="Open full-size Barycentric color interpolation"><img src="assets/task4-triangle.png" width="1600" height="1200" alt="Triangle with a red top vertex, green lower-left vertex, blue lower-right vertex, and smoothly blended interior"></a><figcaption>Barycentric color interpolation</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task4-test7.png" aria-label="Open full-size Color wheel, 1 sample"><img src="assets/task4-test7.png" width="1600" height="1200" alt="basic/test7.svg at the default view with one sample per pixel"></a><figcaption>Color wheel, 1 sample</figcaption></figure></div>
+    <p>In the first image, the bottom edge has no red contribution, so it blends green to blue. Moving upward increases the red weight. The centroid combines equal amounts of red, green, and blue to produce gray, (⅓, ⅓, ⅓). The second image shows <code>svg/basic/test7.svg</code> at the default view and 1 sample per pixel; its triangles blend toward the black center.</p>
+    <p>For each covered sample, I compute weights from signed area ratios, such as α = area(PBC) / area(ABC), then store the weighted color sum in the sample buffer. Reversing the vertex order reverses both area signs, leaving the ratios unchanged. Supersampling averages these interpolated sample colors into each pixel. The sky in the <a href="#art">final artwork</a> is another example of this interpolation.</p>
+  </section>
 
-		Link to webpage: (TODO) <a href="https://cs184.eecs.berkeley.edu/fa26">cs184.eecs.berkeley.edu/fa26</a>
-		
-		<br>
+  <section id="task5" aria-labelledby="task5-title">
+    <h2 id="task5-title">Task 5: Pixel sampling</h2>
+    <p>Pixel sampling chooses a texture color at a UV coordinate. For every covered screen sample, I interpolate the triangle's vertex UVs using barycentric weights, then map (u, v) to texel coordinates using the texture's width and height.</p>
+    <p>Nearest sampling rounds to the closest texel. Bilinear sampling finds the four neighboring texels, blends each row using the fractional x position, and blends the rows using the fractional y position. I clamp coordinates at texture boundaries. With supersampling, each sample gets its own texture lookup before the pixel colors are averaged.</p>
+    <p>These captures of <code>svg/texmap/test1.svg</code> use the same magnified coastline, with the pixel inspector along western Africa.</p>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task5-nearest-1.png" aria-label="Open full-size Nearest, 1 sample"><img src="assets/task5-nearest-1.png" width="1600" height="1200" alt="Magnified coastline with nearest filtering at 1 samples per pixel"></a><figcaption>Nearest, 1 sample</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-nearest-16.png" aria-label="Open full-size Nearest, 16 samples"><img src="assets/task5-nearest-16.png" width="1600" height="1200" alt="Magnified coastline with nearest filtering at 16 samples per pixel"></a><figcaption>Nearest, 16 samples</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-bilinear-1.png" aria-label="Open full-size Bilinear, 1 sample"><img src="assets/task5-bilinear-1.png" width="1600" height="1200" alt="Magnified coastline with bilinear filtering at 1 samples per pixel"></a><figcaption>Bilinear, 1 sample</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-bilinear-16.png" aria-label="Open full-size Bilinear, 16 samples"><img src="assets/task5-bilinear-16.png" width="1600" height="1200" alt="Magnified coastline with bilinear filtering at 16 samples per pixel"></a><figcaption>Bilinear, 16 samples</figcaption></figure></div>
+    <div class="print-page">
+      <h3>Task 5: coastline detail</h3>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task5-nearest-1.png" aria-label="Open full-size Nearest, 1 sample"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task5-nearest-1.png" width="1600" height="1200" alt="Pixel inspector showing nearest coastline filtering at 1 samples per pixel"></span></a><figcaption>Nearest, 1 sample</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-nearest-16.png" aria-label="Open full-size Nearest, 16 samples"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task5-nearest-16.png" width="1600" height="1200" alt="Pixel inspector showing nearest coastline filtering at 16 samples per pixel"></span></a><figcaption>Nearest, 16 samples</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-bilinear-1.png" aria-label="Open full-size Bilinear, 1 sample"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task5-bilinear-1.png" width="1600" height="1200" alt="Pixel inspector showing bilinear coastline filtering at 1 samples per pixel"></span></a><figcaption>Bilinear, 1 sample</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task5-bilinear-16.png" aria-label="Open full-size Bilinear, 16 samples"><span class="crop" style="--ratio:480/480; --width:333.333333%; --left:-233.333333%; --top:0.000000%;"><img src="assets/task5-bilinear-16.png" width="1600" height="1200" alt="Pixel inspector showing bilinear coastline filtering at 16 samples per pixel"></span></a><figcaption>Bilinear, 16 samples</figcaption></figure></div>
+      <p>Nearest at 1 sample produces blocks with abrupt color changes. At 16 samples, their boundaries soften but the blocks remain. Bilinear gives a gradual blue-to-green transition even at 1 sample; increasing to 16 makes a smaller difference here.</p>
+      <p>The difference is largest when magnifying a texture with strongly contrasting neighboring texels. Nearest repeats each texel as a block, while bilinear fills in intermediate colors. Nearly uniform textures look similar with both methods. Neither method alone removes severe minification aliasing, which motivates mipmaps.</p>
+    </div>
+  </section>
 
-		Link to GitHub repository: (TODO) <a href="https://cs184.eecs.berkeley.edu/fa26">cs184.eecs.berkeley.edu/fa26</a>
+  <section id="task6" aria-labelledby="task6-title">
+    <h2 id="task6-title">Task 6: Level sampling</h2>
+    <p>Level sampling chooses a smaller, prefiltered texture when many texels fit inside a screen pixel. I compute the UV changes over one screen pixel in x and y, scale them by the texture dimensions, and take log₂ of the longer derivative vector's length. I clamp the result to the available mip levels.</p>
+    <p><code>L_ZERO</code> always uses level 0. <code>L_NEAREST</code> rounds the level, while <code>L_LINEAR</code> blends adjacent levels. Linear level sampling combined with bilinear pixel sampling gives trilinear filtering.</p>
+    <div class="table-wrap"><table>
+      <caption>Sampling tradeoffs</caption>
+      <thead><tr><th scope="col">Technique</th><th scope="col">Speed and memory</th><th scope="col">Antialiasing effect</th></tr></thead>
+      <tbody><tr><td>Pixel sampling</td><td>Nearest reads 1 texel; bilinear reads 4. Neither needs an extra texture pyramid.</td><td>Bilinear smooths magnification; level-0 sampling still aliases when minified.</td></tr>
+      <tr><td>Level sampling</td><td>One mip lookup for nearest level, two for linear levels. A full square power-of-two mip chain adds about ⅓ to texture memory.</td><td>Prefiltering reduces minification aliasing. Linear levels also smooth transitions between mip levels.</td></tr>
+      <tr><td>Supersampling</td><td>At N samples, sample storage and per-sample work grow roughly by N.</td><td>Smooths geometric edges and improves within-pixel texture estimates, but finite samples can still miss very fine patterns.</td></tr></tbody>
+    </table></div>
+    <p>I chose Frank Klemm's Siemens-star PNG. All four views use the same scale and 1 sample per pixel.</p>
+<div class="image-grid "><figure class=""><a class="image-link" href="assets/task6-zero-nearest.png" aria-label="Open full-size L_ZERO / P_NEAREST"><span class="crop" style="--ratio:948/556; --width:168.776371%; --left:-34.388186%; --top:-57.913669%;"><img src="assets/task6-zero-nearest.png" width="1600" height="1200" alt="Siemens star using level zero and nearest texels, with strong false repeating patterns"></span></a><figcaption>L_ZERO / P_NEAREST</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-zero-bilinear.png" aria-label="Open full-size L_ZERO / P_LINEAR"><span class="crop" style="--ratio:948/556; --width:168.776371%; --left:-34.388186%; --top:-57.913669%;"><img src="assets/task6-zero-bilinear.png" width="1600" height="1200" alt="Siemens star using level zero and bilinear texels, with remaining minification aliasing"></span></a><figcaption>L_ZERO / P_LINEAR</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-nearest-nearest.png" aria-label="Open full-size L_NEAREST / P_NEAREST"><span class="crop" style="--ratio:948/556; --width:168.776371%; --left:-34.388186%; --top:-57.913669%;"><img src="assets/task6-nearest-nearest.png" width="1600" height="1200" alt="Siemens star with nearest mip level and nearest texels, reducing fine-scale aliasing"></span></a><figcaption>L_NEAREST / P_NEAREST</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-nearest-bilinear.png" aria-label="Open full-size L_NEAREST / P_LINEAR"><span class="crop" style="--ratio:948/556; --width:168.776371%; --left:-34.388186%; --top:-57.913669%;"><img src="assets/task6-nearest-bilinear.png" width="1600" height="1200" alt="Siemens star with nearest mip level and bilinear texels, softening fine detail"></span></a><figcaption>L_NEAREST / P_LINEAR</figcaption></figure></div>
+    <p>Level 0 shows false repeating patterns near the center, even with bilinear sampling. Nearest-level sampling reduces these patterns. Adding bilinear sampling gives the smoothest result of these four, while softening fine detail.</p>
+    <p class="credit">Texture: <a href="https://commons.wikimedia.org/wiki/File:Siemens_Star,_3840x2160_pixels,_628_Stripes.png">Siemens star</a> by Frank Klemm, <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>. All resized, transformed, and filtered Siemens-star comparisons on this page use the same license. Each image links to its full renderer capture.</p>
+    <div class="extra print-page" id="task6-extra">
+      <h3>Task 6 extra credit: anisotropic filtering</h3>
+      <p><kbd>A</kbd> enables anisotropic filtering. I use the UV derivatives to find the footprint's principal axes in texture space, select a mip level from its shorter axis, and average trilinear taps along its longer axis. The tap count is capped at 16; larger axis ratios increase the mip level to stay within that limit. This approximates the footprint with a line of samples and reuses the existing mipmaps.</p>
+<div class="image-grid four"><figure class=""><a class="image-link" href="assets/task6-ec-nearest.png" aria-label="Open full-size Nearest"><span class="crop" style="--ratio:480/880; --width:333.333333%; --left:-116.666667%; --top:-18.181818%;"><img src="assets/task6-ec-nearest.png" width="1600" height="1200" alt="Slanted Siemens star with nearest filtering at one sample per pixel"></span></a><figcaption>Nearest</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-ec-bilinear.png" aria-label="Open full-size Bilinear"><span class="crop" style="--ratio:480/880; --width:333.333333%; --left:-116.666667%; --top:-18.181818%;"><img src="assets/task6-ec-bilinear.png" width="1600" height="1200" alt="Slanted Siemens star with bilinear filtering at one sample per pixel"></span></a><figcaption>Bilinear</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-ec-trilinear.png" aria-label="Open full-size Trilinear"><span class="crop" style="--ratio:480/880; --width:333.333333%; --left:-116.666667%; --top:-18.181818%;"><img src="assets/task6-ec-trilinear.png" width="1600" height="1200" alt="Slanted Siemens star with trilinear filtering at one sample per pixel"></span></a><figcaption>Trilinear</figcaption></figure>
+<figure class=""><a class="image-link" href="assets/task6-ec-anisotropic.png" aria-label="Open full-size Anisotropic"><span class="crop" style="--ratio:480/880; --width:333.333333%; --left:-116.666667%; --top:-18.181818%;"><img src="assets/task6-ec-anisotropic.png" width="1600" height="1200" alt="Slanted Siemens star with anisotropic filtering at one sample per pixel"></span></a><figcaption>Anisotropic</figcaption></figure></div>
+      <p>These views use the same slanted texture and 1 sample per pixel. Nearest and bilinear use level 0 and show strong false bands. Trilinear reduces them but blurs spokes around the center. Anisotropic filtering retains more spoke detail while reducing the strongest aliasing. Some fine repeating patterns remain because the finite taps do not integrate the footprint exactly.</p>
+      <div class="table-wrap"><table>
+        <caption>Texture filtering timings</caption>
+        <thead><tr><th scope="col">Filter</th><th scope="col" class="num">Draw time</th></tr></thead>
+        <tbody><tr><td>Nearest</td><td class="num">4.917 ms</td></tr><tr><td>Bilinear</td><td class="num">9.019 ms</td></tr>
+        <tr><td>Trilinear</td><td class="num">10.098 ms</td></tr><tr><td>Anisotropic</td><td class="num">33.612 ms</td></tr></tbody>
+      </table></div>
+      <p>The timings use the same <code>clock()</code> method as Task 1 extra credit, at 1024×1024 and 1 sample per pixel. Anisotropic filtering took about 3.3× as long as trilinear because it performs multiple trilinear lookups per sample, without requiring another texture pyramid.</p>
+      <p class="credit">Reference: <a href="https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_filter_anisotropic.txt">Khronos anisotropic filtering specification</a>.</p>
+    </div>
+  </section>
 
-		<figure>
-			<img src="assets/lion.jpg" alt="Lion" style="width:50%"/>
-			<figcaption>You can add images with captions!</figcaption>
-		</figure>
-
-		<!--
-		We've already added one heading per task, to make your write-up as navigable when grading. Please fit your write-up within these sections!
-		-->
-
-		<h2>Overview</h2>
-		Give a high-level overview of what you implemented in this homework. Think about what you've built as a whole. Share your thoughts on what interesting things you've learned from completing the homework.
-
-		<h2>Task 1: Drawing Single-Color Triangles</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<p>Here is an example 2x2 gridlike structure using an HTML table. Each <b>tr</b> is a row and each <b>td</b> is a column in that row. You might find this useful for framing and showing your result images in an organized fashion.</p>
-		<div style="display: flex; flex-direction: column; align-items: center;">
-			<table style="width: 100%; text-align: center; border-collapse: collapse;">
-			  <tr>
-				<td style="text-align: center;">
-				  <img src="assets/lion.jpg" width="400px"/>
-				  <figcaption>Caption goes here.</figcaption>
-				</td>
-				<td style="text-align: center;">
-				  <img src="assets/lion.jpg" width="400px"/>
-				  <figcaption>Caption goes here.</figcaption>
-				</td>
-			  </tr>
-			  <tr>
-				<td style="text-align: center;">
-				  <img src="assets/lion.jpg" width="400px"/>
-				  <figcaption>Caption goes here.</figcaption>
-				</td>
-				<td style="text-align: center;">
-				  <img src="assets/lion.jpg" width="400px"/>
-				  <figcaption>Caption goes here.</figcaption>
-				</td>
-			  </tr>
-			</table>
-		</div>
-		
-		<h2>Task 2: Antialiasing by Supersampling</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>Task 3: Transforms</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>Task 4: Barycentric coordinates</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>Task 5: "Pixel sampling" for texture mapping</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>Task 6: "Level Sampling" with mipmaps for texture mapping</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>(Optional) Task 7: Extra Credit - Draw Something Creative!</h2>
-		Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-
-		<h2>Additional Notes (please remove)</h2>
-		<ul>
-			<li>You can also add code if you'd like as so: <code>code code code</code></li>
-			<li>If you'd like to add math equations, 
-				<ul>
-					<li>You can write inline equations like so: \( a^2 + b^2 = c^2 \)</li>
-					<li>You can write display equations like so: \[ a^2 + b^2 = c^2 \]</li>
-				</ul>
-			</li>
-		</ul>
-		</div>
-	</body>
+  <section id="art" aria-labelledby="art-title">
+    <h2 id="art-title">Art competition: Amber Campanile</h2>
+    <p>I based this image on a photo I took of the Campanile against an orange sky. I kept the tower on the left, with flat layers for the hills, water, and foreground. Two contrasting faces, simple bell openings, and a plain oval clock suggest the tower without small details.</p>
+<figure class="single art"><a class="image-link" href="assets/competition.png" aria-label="Open full-size Amber Campanile"><img src="assets/competition.png" width="800" height="800" alt="Abstract Campanile with a dark front, warm side, blank oval clock, and layered hills and water against an amber sky"></a><figcaption>Amber Campanile</figcaption></figure>
+    <p><a href="src/generate_competition.py">generate_competition.py</a> creates <a href="competition.svg">competition.svg</a>. The tower and landscape use polygons. Loops place the bell openings and approximate the clock's oval with straight edges. Two color-interpolated triangles form the sky. The final image is 800×800 with 16 samples per pixel.</p>
+  </section>
+  <footer><p class="credit"><a href="#overview">Back to overview</a> · <a href="https://cs184.eecs.berkeley.edu/fa26/hw/hw1/deliverables/">Assignment deliverables</a></p></footer>
+</main>
+</body>
 </html>
